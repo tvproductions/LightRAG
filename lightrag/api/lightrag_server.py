@@ -1222,13 +1222,14 @@ def create_app(args):
     @app.get(docs_path, include_in_schema=False)
     async def custom_swagger_ui_html():
         """Custom Swagger UI HTML with local static files"""
+        swagger_prefix = f"{api_prefix}/static/swagger-ui" if api_prefix else "/static/swagger-ui"
         return get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title=app.title + " - Swagger UI",
             oauth2_redirect_url=f"{docs_path}/oauth2-redirect",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url="/static/swagger-ui/favicon-32x32.png",
+            swagger_js_url=f"{swagger_prefix}/swagger-ui-bundle.js",
+            swagger_css_url=f"{swagger_prefix}/swagger-ui.css",
+            swagger_favicon_url=f"{swagger_prefix}/favicon-32x32.png",
             swagger_ui_parameters=app.swagger_ui_parameters,
         )
 
@@ -1448,9 +1449,10 @@ def create_app(args):
 
     # Mount Swagger UI static files for offline support
     swagger_static_dir = Path(__file__).parent / "static" / "swagger-ui"
+    swagger_static_prefix = f"{api_prefix}/static/swagger-ui" if api_prefix else "/static/swagger-ui"
     if swagger_static_dir.exists():
         app.mount(
-            "/static/swagger-ui",
+            swagger_static_prefix,
             StaticFiles(directory=swagger_static_dir),
             name="swagger-ui-static",
         )
