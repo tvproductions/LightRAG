@@ -1197,7 +1197,7 @@ def create_app(args):
             doc_manager,
             api_key,
         ),
-        prefix=f"{api_prefix}/documents" if api_prefix else "/documents",
+        prefix=api_prefix if api_prefix else "",
     )
     app.include_router(
         create_query_routes(rag, api_key, args.top_k),
