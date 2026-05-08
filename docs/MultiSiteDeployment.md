@@ -354,46 +354,79 @@ processes on localhost.**
 
 ### Scenario 3 — debug through your real production reverse proxy
 
-You already have nginx (or Traefik / Caddy) running locally with the
-exact rules from the deployment guide, and you want HMR to flow through
-it so you're testing the actual deploy path.
+You already have nginx (or Traefik / Caddy) running locally and want HMR
+to flow through it, e.g. to validate that the production reverse-proxy
+rules don't break the WebUI.
+
+The trick: **API traffic must go nginx → backend directly. Do NOT route
+it through Vite.** Vite's `server.proxy` rules are registered with the
+simulated prefix (`/site01/documents/...`), but nginx strips that prefix
+before forwarding, so by the time a request reaches Vite the prefix is
+gone and no Vite proxy rule matches. Splitting nginx into two location
+blocks avoids this trap and also mirrors the real production layout
+(WebUI assets vs API live on different routes anyway).
 
 ```
-Browser ──► localhost:80 (nginx) ──► localhost:5173 (Vite) ──► localhost:9621 (backend)
-                  │
-                  └── strips /site01/ before forwarding to Vite
+                    ┌─► /site01/webui/* ──► localhost:5173 (Vite, HMR)
+Browser ─► nginx ───┤
+                    └─► /site01/*       ──► localhost:9621 (backend)
 ```
 
-This requires three things:
+**Setup:**
 
-1. **Backend with the prefix:** `LIGHTRAG_API_PREFIX=/site01 lightrag-server`.
-2. **Dev server config (`.env.local`):**
+1. **Backend:** `LIGHTRAG_API_PREFIX=/site01 lightrag-server`.
+
+2. **Dev server (`.env.local`):**
    ```bash
-   VITE_BACKEND_URL=http://localhost:9621      # Vite still forwards directly to backend
+   # Vite's server.proxy is unused in this scenario — nginx forwards API
+   # calls to the backend directly. Keep VITE_BACKEND_URL pointed at the
+   # backend anyway so Scenario 2 still works if you bypass nginx.
+   VITE_BACKEND_URL=http://localhost:9621
    VITE_API_PROXY=true
    VITE_API_ENDPOINTS=/api,/documents,/graphs,/graph,/health,/query,/docs,/redoc,/openapi.json,/login,/auth-status,/static
    VITE_DEV_API_PREFIX=/site01
    VITE_DEV_WEBUI_PREFIX=/site01/webui/
    ```
-3. **nginx route the WebUI to Vite, not to the backend:**
+
+3. **nginx — two location blocks, longest match wins:**
    ```nginx
-   location /site01/ {
-       # Forward EVERYTHING to Vite — Vite's proxy handles API forwarding
-       proxy_pass http://127.0.0.1:5173/;
+   # WebUI assets + HMR → Vite
+   location /site01/webui/ {
+       proxy_pass http://127.0.0.1:5173/webui/;   # keep /webui/ so Vite's
+                                                  # asset paths still resolve
        proxy_http_version 1.1;
-       proxy_set_header Upgrade $http_upgrade;        # required for HMR
+       proxy_set_header Upgrade $http_upgrade;    # HMR websocket
        proxy_set_header Connection "upgrade";
        proxy_set_header Host $host;
+   }
+
+   # Everything else under /site01/ → backend (API, /docs, /openapi.json…)
+   location /site01/ {
+       proxy_pass http://127.0.0.1:9621/;         # strips /site01/
        proxy_set_header X-Forwarded-Prefix /site01;
+       proxy_set_header Host $host;
    }
    ```
 
-Open **`http://localhost/site01/`**. The HMR websocket upgrades through
-nginx → Vite, API calls flow Vite → backend.
+Open **`http://localhost/site01/webui/`**. HMR upgrades through nginx →
+Vite; API calls flow browser → nginx → backend (Vite is not in the API
+path).
 
-> Most contributors should prefer Scenario 2. Scenario 3 is only useful
-> when you suspect a bug specific to the reverse-proxy path (e.g. a
-> header-rewriting rule, a redirect mismatch).
+> Most contributors should stay on Scenario 2. Scenario 3 is only worth
+> the setup when you suspect a bug specific to the reverse-proxy itself
+> (a header-rewriting rule, a strip-vs-no-strip mismatch, or a redirect
+> that only fires through nginx).
+
+#### Why `VITE_BACKEND_URL` does **not** need a `/site01` prefix
+
+Vite's proxy is bypassed entirely in this scenario, so `VITE_BACKEND_URL`
+is irrelevant — nginx forwards directly to the backend. If you ever fall
+back to Scenario 2 (no nginx) you'll want `VITE_BACKEND_URL` to stay at
+the backend root: Vite forwards prefixed paths verbatim
+(`/site01/documents/foo` → `http://localhost:9621/site01/documents/foo`),
+and FastAPI's `root_path` matches the prefixed form natively. Adding a
+`/site01` to `VITE_BACKEND_URL` would produce `/site01/site01/documents/foo`
+and 404.
 
 ### Quick decision matrix
 
