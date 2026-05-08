@@ -352,89 +352,107 @@ What happens:
 HMR continues to work unchanged. **No nginx, no Docker — just two
 processes on localhost.**
 
-### Scenario 3 — debug through your real production reverse proxy
+### Scenario 3 — local dev frontend against a real (remote) backend
 
-You already have nginx (or Traefik / Caddy) running locally and want HMR
-to flow through it, e.g. to validate that the production reverse-proxy
-rules don't break the WebUI.
-
-The trick: **API traffic must go nginx → backend directly. Do NOT route
-it through Vite.** Vite's `server.proxy` rules are registered with the
-simulated prefix (`/site01/documents/...`), but nginx strips that prefix
-before forwarding, so by the time a request reaches Vite the prefix is
-gone and no Vite proxy rule matches. Splitting nginx into two location
-blocks avoids this trap and also mirrors the real production layout
-(WebUI assets vs API live on different routes anyway).
+You want to iterate on the WebUI on your laptop while hitting a backend
+that's already in production behind nginx — typically because the real
+backend has data / configs that are painful to reproduce locally. The
+WebUI is purely local (HMR on your laptop); only API traffic crosses the
+network.
 
 ```
-                    ┌─► /site01/webui/* ──► localhost:5173 (Vite, HMR)
-Browser ─► nginx ───┤
-                    └─► /site01/*       ──► localhost:9621 (backend)
+Local machine                                Remote production host
+─────────────────                            ────────────────────────
+Browser ──► localhost:5173 (Vite + HMR)
+                │
+                │  Vite proxy forwards /site01/* verbatim
+                ▼
+              ─── network ───►  nginx ──strips /site01/──► lightrag-server
+                                                          (backend; may
+                                                           or may not have
+                                                           LIGHTRAG_API_PREFIX
+                                                           set — both work)
 ```
+
+The key insight: the production nginx is **already** doing the prefix
+strip. Vite's only job is to forward prefixed paths to nginx unchanged,
+and nginx behaves exactly as it would for a real production browser
+request.
 
 **Setup:**
 
-1. **Backend:** `LIGHTRAG_API_PREFIX=/site01 lightrag-server`.
+1. **Production nginx + backend:** unchanged. Whatever your real deploy
+   already runs.
 
 2. **Dev server (`.env.local`):**
    ```bash
-   # Vite's server.proxy is unused in this scenario — nginx forwards API
-   # calls to the backend directly. Keep VITE_BACKEND_URL pointed at the
-   # backend anyway so Scenario 2 still works if you bypass nginx.
-   VITE_BACKEND_URL=http://localhost:9621
+   # Point at the production reverse proxy — NOT the backend port.
+   VITE_BACKEND_URL=https://prod.example.com         # or http://10.0.0.5
    VITE_API_PROXY=true
    VITE_API_ENDPOINTS=/api,/documents,/graphs,/graph,/health,/query,/docs,/redoc,/openapi.json,/login,/auth-status,/static
    VITE_DEV_API_PREFIX=/site01
    VITE_DEV_WEBUI_PREFIX=/site01/webui/
    ```
 
-3. **nginx — two location blocks, longest match wins:**
-   ```nginx
-   # WebUI assets + HMR → Vite
-   location /site01/webui/ {
-       proxy_pass http://127.0.0.1:5173/webui/;   # keep /webui/ so Vite's
-                                                  # asset paths still resolve
-       proxy_http_version 1.1;
-       proxy_set_header Upgrade $http_upgrade;    # HMR websocket
-       proxy_set_header Connection "upgrade";
-       proxy_set_header Host $host;
-   }
+3. Run `bun run dev` and open **`http://localhost:5173/`**.
 
-   # Everything else under /site01/ → backend (API, /docs, /openapi.json…)
-   location /site01/ {
-       proxy_pass http://127.0.0.1:9621/;         # strips /site01/
-       proxy_set_header X-Forwarded-Prefix /site01;
-       proxy_set_header Host $host;
-   }
-   ```
+What happens for an API call:
 
-Open **`http://localhost/site01/webui/`**. HMR upgrades through nginx →
-Vite; API calls flow browser → nginx → backend (Vite is not in the API
-path).
+- SPA fetches `/site01/documents/foo` (because `apiPrefix=/site01` was
+  injected into `window.__LIGHTRAG_CONFIG__`).
+- Vite's `server.proxy` matches `/site01/documents` and forwards verbatim
+  to `https://prod.example.com/site01/documents/foo`.
+  (`changeOrigin: true` is already set, so the `Host` header is rewritten
+  to the upstream — required for SNI / virtual hosts.)
+- Production nginx matches `/site01/`, strips it, forwards
+  `/documents/foo` to the backend.
+- Backend serves it. `LIGHTRAG_API_PREFIX` on the backend can be set or
+  unset; FastAPI's `root_path` accepts both prefixed and natural forms
+  either way.
 
-> Most contributors should stay on Scenario 2. Scenario 3 is only worth
-> the setup when you suspect a bug specific to the reverse-proxy itself
-> (a header-rewriting rule, a strip-vs-no-strip mismatch, or a redirect
-> that only fires through nginx).
+HMR is purely local — the browser only talks to localhost:5173 for SPA
+assets. No nginx involvement, no special WebSocket-upgrade config to
+worry about.
 
-#### Why `VITE_BACKEND_URL` does **not** need a `/site01` prefix
+#### Why `VITE_BACKEND_URL` does **not** include `/site01`
 
-Vite's proxy is bypassed entirely in this scenario, so `VITE_BACKEND_URL`
-is irrelevant — nginx forwards directly to the backend. If you ever fall
-back to Scenario 2 (no nginx) you'll want `VITE_BACKEND_URL` to stay at
-the backend root: Vite forwards prefixed paths verbatim
-(`/site01/documents/foo` → `http://localhost:9621/site01/documents/foo`),
-and FastAPI's `root_path` matches the prefixed form natively. Adding a
-`/site01` to `VITE_BACKEND_URL` would produce `/site01/site01/documents/foo`
-and 404.
+Vite forwards the request path **verbatim** (no rewrite). The browser
+already emits `/site01/documents/foo`, so the URL Vite sends upstream is
+`${VITE_BACKEND_URL}/site01/documents/foo`. If you set
+`VITE_BACKEND_URL=https://prod.example.com/site01` you'd get
+`https://prod.example.com/site01/site01/documents/foo` — a duplicated
+prefix that nginx and the backend both reject.
+
+Same logic applies to Scenario 2 (`VITE_BACKEND_URL=http://localhost:9621`,
+no prefix): Vite forwards `/site01/documents/foo` unchanged to the
+backend, and FastAPI's `root_path=/site01` matches the prefixed form
+natively.
+
+#### Common pitfalls
+
+- **HTTPS upstream + self-signed cert**: Vite's proxy will reject by
+  default. Set `proxy: { ..., secure: false }` in `vite.config.ts` to
+  skip cert validation when targeting a staging proxy with a non-public
+  cert.
+- **Auth required**: if the production backend requires `LIGHTRAG_API_KEY`,
+  log in via the dev SPA exactly as you would in prod — the auth token
+  flows through the proxy unchanged.
+- **CORS errors**: shouldn't happen because the browser sees same-origin
+  requests to localhost:5173. If they appear, check that
+  `changeOrigin: true` is in effect (it is, by default in
+  `vite.config.ts`).
 
 ### Quick decision matrix
 
-| You want to… | Backend `LIGHTRAG_API_PREFIX` | `VITE_DEV_API_PREFIX` | Reverse proxy? | Open in browser |
+| You want to… | `VITE_BACKEND_URL` | `VITE_DEV_API_PREFIX` | What's in front of the backend | Open in browser |
 | --- | --- | --- | --- | --- |
-| Default single-instance dev | unset | unset | no | `http://localhost:5173/` |
-| Reproduce a multi-site bug locally | `/site01` | `/site01` | no (Vite proxy is enough) | `http://localhost:5173/` |
-| Validate the actual nginx rules | `/site01` | `/site01` | yes (nginx → Vite) | `http://localhost/site01/` |
+| Default single-instance dev | `http://localhost:9621` | unset | local backend, no proxy | `http://localhost:5173/` |
+| Reproduce a multi-site bug locally | `http://localhost:9621` | `/site01` | local backend with `LIGHTRAG_API_PREFIX=/site01`, no nginx | `http://localhost:5173/` |
+| Hit a real (remote) backend through its production nginx | `https://prod.example.com` | `/site01` | production nginx already strips `/site01/` | `http://localhost:5173/` |
+
+In every case the browser only talks to local Vite at `localhost:5173`;
+the column on the right is the same. Where the API traffic ultimately
+lands is what differs.
 
 ---
 
