@@ -83,7 +83,7 @@ async def test_upsert_edge_contains_optional_match_delete_create():
     assert "CREATE (source)-[r:DIRECTED" in sql
     assert "]->(target)" in sql
     # Edge properties must be inlined into the CREATE clause as a literal map.
-    assert "`weight`: \"0.5\"" in sql
+    assert '`weight`: "0.5"' in sql
     assert "RETURN r" in sql
 
 
